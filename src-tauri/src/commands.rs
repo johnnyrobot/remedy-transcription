@@ -478,6 +478,32 @@ fn fail_job(state: &AppState, job_id: &str, message: String) {
 }
 
 #[tauri::command]
+pub async fn get_youtube_playlist(
+    url: String,
+    app: AppHandle,
+) -> Result<crate::playlist::PlaylistPreview, String> {
+    let url = crate::playlist::canonical_playlist_url(&url)?;
+    let handle = spawn_sidecar(
+        &app,
+        "yt-dlp",
+        &[
+            "--flat-playlist",
+            "--dump-single-json",
+            "--skip-download",
+            "--yes-playlist",
+            "--ignore-errors",
+            "--no-warnings",
+            "--",
+            &url,
+        ],
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    let value = collect_json_output(handle).await?;
+    crate::playlist::parse_playlist(value, url)
+}
+
+#[tauri::command]
 pub async fn create_youtube_job(
     request: YouTubeJobRequest,
     app: AppHandle,

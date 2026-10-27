@@ -9,7 +9,7 @@ import {
     TaskMode,
     resolveModelConfig,
 } from "../config/transcription";
-import { EngineId, engineById, modelDiarizes } from "../config/engines";
+import { EngineId, engineById } from "../config/engines";
 import { createLocalEngine } from "./engines/localEngine";
 import { createGeminiEngine } from "./engines/geminiEngine";
 import {
@@ -19,6 +19,7 @@ import {
     type TranscriptionEngine,
 } from "./engines/types";
 import { useWorker } from "./useWorker";
+import { usePlaylistQueue, type YouTubeRunResult } from "./usePlaylistQueue";
 import { detectBrowserCaps } from "../utils/detectBrowserCaps";
 import {
     ConsolidatedSegment,
@@ -31,6 +32,7 @@ import {
     consolidateWorkerTranscript,
     segmentsForPersistence,
 } from "../lib/workerTranscript";
+import { segmentsWithTrustedSpeakers } from "../lib/persistedTranscript";
 import type { SpeakerTurn } from "../lib/speakerAlignment";
 import {
     api,
@@ -38,7 +40,6 @@ import {
     ModelStatusResponse,
     PersistTranscriptRequest,
     SpeakerNames,
-    TranscriptionSegment,
 } from "../services/api";
 
 interface ProgressItem {
@@ -94,7 +95,9 @@ export interface Transcriber {
      * dialog or a file drop.
      */
     start: (path: string) => void;
-    startFromYouTube: (url: string) => void;
+    startFromYouTube: (url: string) => Promise<YouTubeRunResult>;
+    playlist: ReturnType<typeof usePlaylistQueue>;
+    openPlaylistJob: (jobId: string) => Promise<void>;
     /**
      * Run the LAST source again, skipping the transcript cache.
      *
@@ -208,41 +211,6 @@ function mixToMono(audioBuffer: AudioBuffer): Float32Array {
     }
 
     return mono;
-}
-
-/**
- * A stored job's segments, with speaker labels no engine in this build could
- * have written stripped back off them.
- *
- * 1.1.0's local sherpa-onnx diarizer was deleted in 1.2.0 for mislabelling one
- * narrator as dozens of speakers. Deleting the diarizer did not delete what it
- * had already written: `speaker` is baked into every persisted segment row, and
- * `applyCompletedJob` reads those labels straight off the rows — so reopening a
- * pre-1.2.0 local transcript still paints SPEAKER_00 … SPEAKER_51 across it,
- * offers to rename all fifty-two of them, and exports them into the SRT. The
- * feature is gone; only its output is still on screen.
- *
- * This is the one read path those rows come back through (`consolidateSegments`
- * has exactly one production caller), so it is the one place to catch them.
- *
- * DELETES THE KEY, rather than setting it to `undefined` or `""`. A segment
- * without a speaker must render and serialize EXACTLY as it did before
- * diarization existed — that is the documented contract on
- * `TranscriptionSegment.speaker`, and `consolidateSegments` reads presence, not
- * truthiness, when it decides where to break a cue.
- *
- * Returns the SAME ARRAY when nothing needs stripping, which is every transcript
- * this build writes: a fresh local run has no labels to begin with and a Gemini
- * run's are real. The copy is paid for only by the transcripts that are wrong.
- */
-function segmentsWithTrustedSpeakers(job: Job): TranscriptionSegment[] {
-    if (modelDiarizes(job.model_id)) {
-        return job.segments;
-    }
-    if (!job.segments.some((segment) => segment.speaker !== undefined)) {
-        return job.segments;
-    }
-    return job.segments.map(({ speaker: _dropped, ...rest }) => rest);
 }
 
 export function useTranscriber(): Transcriber {
@@ -1117,6 +1085,7 @@ export function useTranscriber(): Transcriber {
             // `applyCompletedJob` reads it straight off them. See the comment
             // there.
             applyCompletedJob(persistedJob, config.presetLabel);
+            return persistedJob;
         },
         [applyCompletedJob],
     );
@@ -1229,7 +1198,7 @@ export function useTranscriber(): Transcriber {
                     return;
                 }
                 applyCompletedJob(initialJob, config.presetLabel);
-                return;
+                return initialJob;
             }
 
             handleBackendJobUpdate(initialJob);
@@ -1252,7 +1221,7 @@ export function useTranscriber(): Transcriber {
                     return;
                 }
                 applyCompletedJob(readyJob, config.presetLabel);
-                return;
+                return readyJob;
             }
 
             // No `setStatus("loading-audio")` here: that phase is not true of
@@ -1334,7 +1303,7 @@ export function useTranscriber(): Transcriber {
                 setSpeakerOutcome(engineResult.speakers);
             }
 
-            await persistWorkerTranscript(
+            return await persistWorkerTranscript(
                 readyJob,
                 config,
                 engineResult.transcript,
@@ -1401,12 +1370,16 @@ export function useTranscriber(): Transcriber {
     );
 
     const startFromYouTube = useCallback(
-        async (url: string, options?: { force?: boolean }) => {
+        async (
+            url: string,
+            options?: { force?: boolean },
+        ): Promise<YouTubeRunResult> => {
             const runId = claimRun();
             runEngineRef.current = engine;
             lastSourceRef.current = { kind: "youtube", url };
             try {
                 const config = await beginRun(runId);
+                if (runIdRef.current !== runId) return { status: "cancelled" };
                 const job = await api.createYouTubeJob({
                     url,
                     model_id: config.modelId,
@@ -1414,16 +1387,31 @@ export function useTranscriber(): Transcriber {
                     language: config.language,
                     force: options?.force ?? false,
                 });
-                if (runIdRef.current !== runId) {
-                    return;
-                }
+                if (runIdRef.current !== runId) return { status: "cancelled" };
                 setJobId(job.id);
-                await transcribePreparedJob(job, config, runId);
+                const completed = await transcribePreparedJob(
+                    job,
+                    config,
+                    runId,
+                );
+                return completed && runIdRef.current === runId
+                    ? { status: "completed", jobId: completed.id }
+                    : { status: "cancelled" };
             } catch (nextError) {
-                if (runIdRef.current !== runId) {
-                    return;
-                }
+                if (runIdRef.current !== runId) return { status: "cancelled" };
                 failRun(nextError, "YouTube preparation failed");
+                if (
+                    nextError instanceof Error &&
+                    nextError.message === RUN_DECLINED
+                )
+                    return { status: "cancelled" };
+                return {
+                    status: "failed",
+                    error:
+                        nextError instanceof Error
+                            ? nextError.message
+                            : String(nextError),
+                };
             }
         },
         [beginRun, claimRun, engine, failRun, transcribePreparedJob],
@@ -1513,6 +1501,26 @@ export function useTranscriber(): Transcriber {
         setError(null);
     }, [claimRun]);
 
+    const playlist = usePlaylistQueue(startFromYouTube, cancel);
+
+    const openPlaylistJob = useCallback(
+        async (id: string) => {
+            const token = claimRun();
+            const job = await api.getJob(id);
+            if (runIdRef.current !== token) return;
+            if (job.status !== "completed")
+                throw new Error("This transcript has not completed");
+            lastSourceRef.current = {
+                kind: "youtube",
+                url: `https://www.youtube.com/watch?v=${job.source_key}`,
+            };
+            setSpeakerNames({});
+            setSpeakerOutcome(null);
+            applyCompletedJob(job, job.model_id);
+        },
+        [claimRun, applyCompletedJob],
+    );
+
     /** The user accepted the bill: let the parked engine proceed. */
     const approveCost = useCallback(
         () => settlePendingCost(true),
@@ -1549,13 +1557,17 @@ export function useTranscriber(): Transcriber {
     return useMemo(
         () => ({
             onInputChange,
-            isBusy,
+            isBusy: isBusy || playlist.running,
             isModelLoading,
             progressItems,
             start: startFromFile,
             startFromYouTube,
-            retranscribe,
-            cancel,
+            retranscribe: () => {
+                if (!playlist.running) retranscribe();
+            },
+            cancel: playlist.running ? playlist.stop : cancel,
+            playlist,
+            openPlaylistJob,
             output: transcript,
             jobId,
             error,
@@ -1589,6 +1601,8 @@ export function useTranscriber(): Transcriber {
             declineCost,
         }),
         [
+            playlist,
+            openPlaylistJob,
             approveCost,
             browserCaps,
             cancel,

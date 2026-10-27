@@ -217,3 +217,17 @@ export interface GeminiTranscriptionResult {
     speakers: SpeakerOutcome;
     audio_duration: number;
 }
+
+export interface PlaylistEntry {
+    position: number;
+    video_id: string | null;
+    url: string | null;
+    title: string;
+    unavailable_reason: string | null;
+}
+
+export interface PlaylistPreview {
+    title: string;
+    url: string;
+    entries: PlaylistEntry[];
+}

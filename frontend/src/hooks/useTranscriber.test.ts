@@ -157,6 +157,7 @@ function workerComplete(runId: unknown, text: string) {
 }
 
 beforeEach(() => {
+    localStorage.clear();
     vi.useFakeTimers();
     for (const mock of Object.values(mocks)) {
         mock.mockReset();
@@ -1739,5 +1740,143 @@ describe("a transcript labelled by the deleted local diarizer", () => {
         );
         expect(speakers).toContain("SPEAKER_00");
         expect(speakers).toContain("SPEAKER_37");
+    });
+});
+
+describe("playlist integration with the real transcriber", () => {
+    const course = {
+        title: "Course",
+        url: "https://youtube.com/playlist?list=PLcourse",
+        entries: ["aaaaaaaaaaa", "bbbbbbbbbbb"].map((id, index) => ({
+            position: index + 1,
+            video_id: id,
+            title: id,
+            url: `https://www.youtube.com/watch?v=${id}`,
+            unavailable_reason: null,
+        })),
+    };
+
+    it("waits for database persistence before advancing and retains earlier results for viewing", async () => {
+        const cached = makeJob({
+            id: "job-2",
+            source_type: "youtube",
+            source_key: "bbbbbbbbbbb",
+            status: "completed",
+            full_text: "Second lecture",
+        });
+        mocks.createYouTubeJob
+            .mockResolvedValueOnce(makeJob({ id: "job-1", status: "ready" }))
+            .mockResolvedValue(cached);
+        let finishPersist!: (job: Job) => void;
+        mocks.persistTranscript.mockImplementation(
+            () =>
+                new Promise<Job>((resolve) => {
+                    finishPersist = resolve;
+                }),
+        );
+        const { result } = await renderTranscriber();
+        act(() => result.current.playlist.load(course));
+        let batch!: Promise<void>;
+        act(() => {
+            batch = result.current.playlist.start();
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "First lecture"));
+        expect(result.current.status).toBe("persisting");
+        expect(mocks.createYouTubeJob).toHaveBeenCalledTimes(1);
+        expect(result.current.playlist.batch?.entries[0].status).toBe(
+            "running",
+        );
+        const first = makeJob({
+            id: "job-1",
+            source_type: "youtube",
+            source_key: "aaaaaaaaaaa",
+            status: "completed",
+            full_text: "First lecture",
+        });
+        await act(async () => {
+            finishPersist(first);
+            await batch;
+        });
+        expect(
+            result.current.playlist.batch?.entries.map((entry) => entry.jobId),
+        ).toEqual(["job-1", "job-2"]);
+        expect(result.current.isBusy).toBe(false);
+        expect(result.current.jobId).toBe("job-2");
+        mocks.getJob.mockResolvedValue(first);
+        await act(async () => {
+            await result.current.openPlaylistJob("job-1");
+        });
+        expect(result.current.jobId).toBe("job-1");
+        expect(result.current.output?.text).toBe("First lecture");
+        act(() => result.current.retranscribe());
+        await settle();
+        expect(mocks.createYouTubeJob.mock.calls[2][0]).toMatchObject({
+            url: course.entries[0].url,
+            force: true,
+        });
+    });
+
+    it("does not start another video after Stop while the first transcript is being saved", async () => {
+        mocks.createYouTubeJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "ready" }),
+        );
+        let finishPersist!: (job: Job) => void;
+        mocks.persistTranscript.mockImplementation(
+            () =>
+                new Promise<Job>((resolve) => {
+                    finishPersist = resolve;
+                }),
+        );
+        const { result } = await renderTranscriber();
+        act(() => result.current.playlist.load(course));
+        let batch!: Promise<void>;
+        act(() => {
+            batch = result.current.playlist.start();
+        });
+        await settle();
+        await emitFromWorker(workerComplete(postedRunId(0), "First lecture"));
+        act(() => result.current.cancel());
+        await act(async () => {
+            finishPersist(makeJob({ id: "job-1", status: "completed" }));
+            await batch;
+        });
+        expect(mocks.createYouTubeJob).toHaveBeenCalledTimes(1);
+        expect(result.current.playlist.running).toBe(false);
+        expect(
+            result.current.playlist.batch?.entries.map((entry) => entry.status),
+        ).toEqual(["pending", "pending"]);
+        expect(result.current.isBusy).toBe(false);
+    });
+
+    it("stops the whole playlist when Gemini's existing long-video cost confirmation is declined", async () => {
+        mocks.createYouTubeJob.mockResolvedValue(
+            makeJob({ id: "job-1", status: "ready" }),
+        );
+        mocks.estimateGeminiCost.mockResolvedValue({
+            duration_secs: 3600,
+            chunk_count: 3,
+            estimated_usd: 0.3,
+            diarization_available: false,
+        });
+        const { result } = await renderTranscriber();
+        act(() => result.current.setEngine("gemini"));
+        act(() => result.current.playlist.load(course));
+        let batch!: Promise<void>;
+        act(() => {
+            batch = result.current.playlist.start();
+        });
+        await settle();
+        expect(result.current.pendingCost).not.toBeNull();
+        await act(async () => {
+            result.current.declineCost();
+            await batch;
+        });
+        expect(mocks.createYouTubeJob).toHaveBeenCalledTimes(1);
+        expect(mocks.transcribeWithGemini).not.toHaveBeenCalled();
+        expect(result.current.playlist.running).toBe(false);
+        expect(result.current.playlist.batch?.entries[0].status).toBe(
+            "pending",
+        );
     });
 });

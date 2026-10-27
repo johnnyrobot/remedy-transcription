@@ -1,8 +1,13 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
-import { ConsolidatedSegment } from "../lib/captionFormatter";
+import { join } from "@tauri-apps/api/path";
+import { segmentsWithTrustedSpeakers } from "../lib/persistedTranscript";
+import {
+    ConsolidatedSegment,
+    consolidateSegments,
+} from "../lib/captionFormatter";
 import {
     generateJson,
     generateSrt,
@@ -20,6 +25,7 @@ import {
     PersistTranscriptRequest,
     QueueStatus,
     SpeakerNames,
+    PlaylistPreview,
     YouTubeJobRequest,
 } from "./types";
 
@@ -36,6 +42,7 @@ export type {
     QueueStatus,
     SpeakerNames,
     TranscriptionSegment,
+    PlaylistPreview,
     YouTubeJobRequest,
 } from "./types";
 
@@ -46,6 +53,71 @@ class TauriApiClient {
 
     async createYouTubeJob(payload: YouTubeJobRequest): Promise<Job> {
         return invoke<Job>("create_youtube_job", { request: payload });
+    }
+
+    async getYouTubePlaylist(url: string): Promise<PlaylistPreview> {
+        return invoke<PlaylistPreview>("get_youtube_playlist", { url });
+    }
+
+    async exportPlaylistTranscripts(
+        items: { jobId: string; position: number }[],
+        format: "srt" | "vtt" | "txt" | "json",
+    ): Promise<number | null> {
+        const directory = await open({
+            directory: true,
+            multiple: false,
+            title: "Export playlist transcripts",
+        });
+        if (typeof directory !== "string") return null;
+        let written = 0;
+        for (const item of items) {
+            try {
+                const job = await this.getJob(item.jobId);
+                if (job.status !== "completed")
+                    throw new Error("Transcript is not complete");
+                const captions = consolidateSegments(
+                    segmentsWithTrustedSpeakers(job),
+                ).filter((cue) => cue.text.trim());
+                const names = await this.getSpeakerNames(job.id);
+                const title =
+                    (job.filename || job.source_key)
+                        .replace(/[<>:"/\\|?*]/g, "_")
+                        .split("")
+                        .map((character) =>
+                            character.charCodeAt(0) < 32 ? "_" : character,
+                        )
+                        .join("")
+                        .replace(/[. ]+$/g, "")
+                        .slice(0, 100) || "video";
+                const filename = `${String(item.position).padStart(
+                    3,
+                    "0",
+                )}-${title}-${job.source_key}.${format}`;
+                const destination = await join(directory, filename);
+                const generators = {
+                    srt: generateSrt,
+                    vtt: generateVtt,
+                    txt: generateTxt,
+                    json: generateJson,
+                };
+                await invoke("export_transcript", {
+                    request: {
+                        destination,
+                        content: generators[format](captions, names),
+                    },
+                });
+                written++;
+            } catch (error) {
+                throw new Error(
+                    `Export stopped after ${written} file(s). Video ${
+                        item.position
+                    }: ${
+                        error instanceof Error ? error.message : String(error)
+                    }`,
+                );
+            }
+        }
+        return written;
     }
 
     async getJob(jobId: string): Promise<Job> {

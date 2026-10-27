@@ -14,6 +14,35 @@ Why "local-first": YouTube blocks data-center IPs, so a self-hosted (VPS) versio
 - **yt-dlp / ffmpeg / ffprobe** (bundled as Tauri sidecar binaries)
 - **rusqlite** (transcript cache, in OS app-data dir)
 
+## Transcribe a YouTube playlist
+
+In **Transcribe a playlist**, paste a playlist link (a watch link containing
+`list=` also works) and select **Load playlist**. Review the video list, choose
+an engine and settings, then select **Transcribe playlist**. Each available
+video runs through the existing download, transcription, and SQLite cache
+pipeline, one at a time. The queue waits until a transcript is saved before
+advancing. Private, deleted, or inaccessible videos are reported individually;
+a failed video does not prevent the rest from running. YouTube can omit
+unavailable entries from its listing, so the preview covers the entries it
+returns.
+
+**Stop playlist** stops the active transcription and prevents the next video
+from starting. An already running yt-dlp/ffmpeg process may finish in the
+background, as with single-video cancellation. Keep the app open while a batch
+runs. The playlist and its progress are saved locally; after reopening the app,
+select **Resume / retry remaining** to continue with the current settings.
+Completed entries are skipped, and the transcript cache also avoids repeating
+work for duplicate videos. Nothing resumes automatically. Loading a different
+playlist replaces the queue, while completed transcripts remain cached.
+
+Use **View** beside a completed video to open its transcript, or **Export
+completed** to write TXT, SRT, VTT, or JSON files to a chosen folder. File names
+include playlist positions and video IDs, preserving order and distinguishing
+repeated titles. Exporting again to the same folder replaces matching files.
+Gemini retains the single-video engine's existing long-video cost confirmation;
+declining that confirmation stops the playlist. The existing two-hour limit
+applies to each video.
+
 ## Requirements
 
 - macOS 11+ (Apple Silicon) or Windows 10+
