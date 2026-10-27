@@ -6,6 +6,7 @@ mod commands;
 mod events;
 mod gemini;
 mod paths;
+mod playlist;
 mod sidecar;
 mod store;
 
@@ -47,6 +48,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::create_youtube_job,
+            commands::get_youtube_playlist,
             commands::create_file_job,
             commands::get_job,
             commands::get_prepared_audio_path,

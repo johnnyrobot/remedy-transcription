@@ -12,6 +12,7 @@ import Modal from "./modal/Modal";
 import { UrlInput } from "./modal/UrlInput";
 import { Transcriber } from "../hooks/useTranscriber";
 import Progress from "./Progress";
+import PlaylistPanel from "./PlaylistPanel";
 import GeminiKeyDialog from "./GeminiKeyDialog";
 import CostConfirmationDialog from "./CostConfirmationDialog";
 import { ENGINES, EngineId, engineById } from "../config/engines";
@@ -519,6 +520,11 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                 <ProgressBar progress={progressValue} />
             </div>
 
+            <PlaylistPanel
+                transcriber={transcriber}
+                engineReady={engineReady}
+            />
+
             {props.transcriber.isBusy && (
                 <div className='w-full mt-4 p-4 bg-white rounded-lg shadow-xl shadow-black/5 ring-1 ring-slate-700/10'>
                     <div className='flex items-center justify-center'>
@@ -614,7 +620,10 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
     const engine = engineById(props.transcriber.engine);
 
     return (
-        <div className='flex flex-col gap-3 text-sm'>
+        <fieldset
+            disabled={props.transcriber.isBusy}
+            className='flex flex-col gap-3 text-sm'
+        >
             <div className='grid grid-cols-1 md:grid-cols-3 gap-3'>
                 {engine.modelId === null ? (
                     <label className='flex flex-col text-slate-600'>
@@ -708,7 +717,7 @@ function SettingsPanel(props: { transcriber: Transcriber }) {
                     apply.
                 </p>
             )}
-        </div>
+        </fieldset>
     );
 }
 
